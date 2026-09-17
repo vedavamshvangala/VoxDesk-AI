@@ -1,0 +1,13 @@
+groq
+langchain-groq
+langchain-core
+python-dotenv
+psutil
+PyAutoGUI
+pywin32
+pywinauto
+pytest
+sounddevice
+numpy
+openwakeword
+playwright
