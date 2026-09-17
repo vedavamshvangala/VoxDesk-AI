@@ -1,6 +1,7 @@
 
 from pathlib import Path
 from typing import Any
+import re
 
 from app.core.agent import AXE
 from app.voice.normalizer import VoiceCommandNormalizer
@@ -159,10 +160,230 @@ class VoiceAssistant:
 
         return result
 
+    def _normalize_approval_response(self, text: str) -> str:
+        """
+        Normalize spoken approval/rejection responses so AXE can
+        recognize common STT punctuation and natural wording.
+
+        Examples:
+
+            "Yes."          -> "yes"
+            "YES!"          -> "yes"
+            "Yes, please."  -> "yes"
+            "Yes go ahead"  -> "yes"
+            "No."           -> "no"
+            "No, cancel it" -> "no"
+        """
+
+        value = text.strip().lower()
+
+        # Remove common punctuation introduced by STT.
+        value = re.sub(r"[.!?,;:]+", " ", value)
+
+        # Normalize whitespace.
+        value = re.sub(r"\s+", " ", value).strip()
+
+        # Direct approval responses.
+        positive_exact = {
+            "yes",
+            "y",
+            "yeah",
+            "yep",
+            "yup",
+            "sure",
+            "okay",
+            "ok",
+            "alright",
+            "all right",
+            "go ahead",
+            "do it",
+            "continue",
+            "proceed",
+            "approve",
+            "approved",
+        }
+
+        # Direct rejection responses.
+        negative_exact = {
+            "no",
+            "n",
+            "nope",
+            "nah",
+            "cancel",
+            "stop",
+            "reject",
+            "rejected",
+            "dont",
+            "don't",
+            "do not",
+        }
+
+        if value in positive_exact:
+            return "yes"
+
+        if value in negative_exact:
+            return "no"
+
+        # Handle common natural spoken approval phrases.
+        positive_prefixes = (
+            "yes ",
+            "yeah ",
+            "yep ",
+            "yup ",
+            "sure ",
+            "okay ",
+            "ok ",
+            "go ahead ",
+            "do it ",
+            "continue ",
+            "proceed ",
+            "approve ",
+        )
+
+        negative_prefixes = (
+            "no ",
+            "nope ",
+            "nah ",
+            "cancel ",
+            "stop ",
+            "reject ",
+            "don't ",
+            "dont ",
+            "do not ",
+        )
+
+        if value.startswith(positive_prefixes):
+            return "yes"
+
+        if value.startswith(negative_prefixes):
+            return "no"
+
+        # If the response contains a very clear approval phrase,
+        # treat it as approval.
+        positive_phrases = (
+            "yes please",
+            "yes go ahead",
+            "yes continue",
+            "yes do it",
+            "please continue",
+            "please proceed",
+        )
+
+        negative_phrases = (
+            "no please",
+            "no cancel",
+            "no stop",
+            "don't continue",
+            "do not continue",
+        )
+
+        if value in positive_phrases:
+            return "yes"
+
+        if value in negative_phrases:
+            return "no"
+
+        # Return the cleaned value if it is not recognized.
+        # AXE will then safely keep the task pending.
+        return value
+
+    def _listen_for_approval(self) -> dict[str, Any]:
+        """
+        Listen specifically for the user's response to an AXE
+        approval request.
+
+        The Alexa wake word is NOT required here.
+
+        The user can simply say:
+            Yes
+        or:
+            No
+        """
+
+        print()
+        print("====================================")
+        print("       AXE APPROVAL REQUIRED")
+        print("====================================")
+        print("Listening for approval...")
+        print("Say: Yes or No")
+        print()
+
+        approval_input = self.listen()
+
+        if not approval_input.get("success"):
+            return {
+                "success": False,
+                "approved": None,
+                "response": "",
+                "input": approval_input,
+                "message": approval_input.get(
+                    "message",
+                    "Could not capture your approval response.",
+                ),
+            }
+
+        raw_approval_text = approval_input.get(
+            "normalized_text",
+            "",
+        ).strip()
+
+        print(
+            f"Approval response received: "
+            f"{raw_approval_text}"
+        )
+
+        if not raw_approval_text:
+            return {
+                "success": False,
+                "approved": None,
+                "response": "",
+                "input": approval_input,
+                "message": "No approval response was detected.",
+            }
+
+        # IMPORTANT:
+        # Whisper returned "Yes." in the failing test.
+        # Convert it to "yes" before sending it to AXE.
+        approval_text = self._normalize_approval_response(
+            raw_approval_text
+        )
+
+        print(
+            f"Approval response normalized: "
+            f"{approval_text}"
+        )
+
+        # Send the normalized approval directly to AXE.
+        #
+        # AXE already owns the pending task and will:
+        #
+        #   yes -> execute pending task
+        #   no  -> cancel pending task
+        #
+        response = self.axe.respond(approval_text)
+
+        print(f"AXE approval response: {response}")
+
+        approved = approval_text == "yes"
+        rejected = approval_text == "no"
+
+        return {
+            "success": True,
+            "approved": approved if approved or rejected else None,
+            "response": response,
+            "input": approval_input,
+            "normalized_approval": approval_text,
+            "message": "Approval response processed by AXE.",
+        }
+
     def process_voice_command(self) -> dict[str, Any]:
         """
-        Wait for Alexa, then process one voice command through
-        STT, normalization, AXE, and TTS.
+        Wait for Alexa, process one voice command through STT,
+        normalization, AXE, and TTS.
+
+        If AXE requests human approval, immediately enter a
+        dedicated approval-listening state without requiring
+        the Alexa wake word again.
         """
 
         wake_result = self.wait_for_wake_word()
@@ -209,7 +430,11 @@ class VoiceAssistant:
                 "tts_result": None,
             }
 
-        raw_text = voice_input.get("raw_text", "").strip()
+        raw_text = voice_input.get(
+            "raw_text",
+            "",
+        ).strip()
+
         normalized_text = voice_input.get(
             "normalized_text",
             "",
@@ -236,6 +461,62 @@ class VoiceAssistant:
 
         tts_result = self.speak(response)
 
+        # ---------------------------------------------------------
+        # HUMAN APPROVAL FLOW
+        # ---------------------------------------------------------
+        #
+        # If AXE has stored a pending task, the previous command
+        # requires human approval.
+        #
+        # We now listen directly for "yes" or "no".
+        #
+        # No Alexa wake word is required here.
+        # ---------------------------------------------------------
+
+        approval_result = None
+        approval_tts_result = None
+
+        if self.axe.pending_task is not None:
+            print()
+            print("AXE is waiting for your approval.")
+            print(
+                "The next voice input will be treated "
+                "as approval."
+            )
+            print()
+
+            approval_result = self._listen_for_approval()
+
+            if approval_result.get("success"):
+                approval_response = approval_result.get(
+                    "response",
+                    "",
+                )
+
+                if approval_response:
+                    approval_tts_result = self.speak(
+                        approval_response
+                    )
+
+                response = approval_response
+
+            else:
+                print(
+                    "AXE approval listening failed: "
+                    f"{approval_result.get('message', 'Unknown error.')}"
+                )
+
+                approval_message = (
+                    "I could not hear your approval response. "
+                    "Please try the command again."
+                )
+
+                approval_tts_result = self.speak(
+                    approval_message
+                )
+
+                response = approval_message
+
         return {
             **voice_input,
             "success": True,
@@ -243,6 +524,8 @@ class VoiceAssistant:
             "wake_result": wake_result,
             "axe_response": response,
             "tts_result": tts_result,
+            "approval_result": approval_result,
+            "approval_tts_result": approval_tts_result,
             "message": "Voice command processed by AXE.",
         }
 
@@ -260,10 +543,18 @@ if __name__ == "__main__":
     print("====================================")
     print("           VOICE RESULT")
     print("====================================")
-    print(f"Wake word:    {result.get('wake_result', {})}")
-    print(f"Raw STT:      {result.get('raw_text', '')}")
-    print(f"AXE Input:    {result.get('normalized_text', '')}")
-    print(f"AXE Response: {result.get('axe_response', '')}")
-    print(f"TTS Result:   {result.get('tts_result', {})}")
-    print(f"Status:       {result.get('success')}")
+    print(f"Wake word:          {result.get('wake_result', {})}")
+    print(f"Raw STT:            {result.get('raw_text', '')}")
+    print(f"AXE Input:          {result.get('normalized_text', '')}")
+    print(f"AXE Response:       {result.get('axe_response', '')}")
+    print(f"TTS Result:         {result.get('tts_result', {})}")
+    print(
+        f"Approval Result:    "
+        f"{result.get('approval_result', {})}"
+    )
+    print(
+        f"Approval TTS:       "
+        f"{result.get('approval_tts_result', {})}"
+    )
+    print(f"Status:             {result.get('success')}")
 
